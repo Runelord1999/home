@@ -105,6 +105,16 @@
     transition:.25s;pointer-events:none;z-index:50;box-shadow:0 8px 30px rgba(0,0,0,.5);white-space:pre-line}
   #toast.show{opacity:1;transform:translate(-50%,0)}
   .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  .right{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border-radius:999px;
+    background:var(--card);border:1px solid var(--line);font-size:13px;font-weight:700;color:var(--muted)}
+  .pill .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+  .pill.ok .dot{background:var(--accent)} .pill.ok{color:var(--text)}
+  .pill.syncing .dot{background:var(--gold);animation:blink 1s infinite}
+  .pill.warn .dot{background:var(--hot)} .pill.warn{color:var(--hot)}
+  .pill.err .dot{background:var(--danger)} .pill.err{color:var(--danger)}
+  @keyframes blink{50%{opacity:.25}}
+  @media(prefers-reduced-motion:reduce){.pill.syncing .dot{animation:none}}
 </style>
 </head>
 <body>
@@ -113,7 +123,10 @@
     <h1>Home <span>Gym</span></h1>
     <p class="tag">Show up. Log it. Beat last week.</p>
   </div>
-  <button class="btn primary" data-act="new-profile">+ Profile</button>
+  <div class="right">
+    <button class="pill" id="syncPill" data-act="sync-now" title="Sync now"><span class="dot"></span><span id="syncTxt">Local only</span></button>
+    <button class="btn primary" data-act="new-profile">+ Profile</button>
+  </div>
 </header>
 
 <main class="layout">
@@ -135,8 +148,9 @@
     <button class="btn small" data-act="export">Export backup</button>
     <button class="btn small" data-act="import">Import backup</button>
     <input type="file" id="importFile" accept="application/json,.json" class="sr">
+    <button class="btn small" data-act="setup">Sync settings</button>
   </div>
-  <div>Data is saved on <b>this device only</b> for now. Use export/import to move it between devices until sync is switched on.</div>
+  <div id="footNote"></div>
 </footer>
 
 <dialog id="dlg">
@@ -169,6 +183,28 @@
     <div class="actions" style="justify-content:flex-end">
       <button type="button" class="btn" data-act="dlg-cancel">Cancel</button>
       <button type="submit" class="btn primary">Save</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="sdlg">
+  <form id="sform" novalidate>
+    <h2 style="margin-bottom:6px">Family sync</h2>
+    <p class="meta" style="margin:0 0 14px">Enter the household PIN to share workouts across every device. Leave it blank to keep this device on its own.</p>
+    <div class="field" id="urlRow" style="margin-bottom:10px">
+      <label for="sUrl">Sync address</label>
+      <input id="sUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://....workers.dev">
+    </div>
+    <div class="field" style="margin-bottom:10px">
+      <label for="sPin">Household PIN</label>
+      <input id="sPin" type="password" inputmode="numeric" autocomplete="off" maxlength="32">
+    </div>
+    <div class="err" id="sErr"></div>
+    <div class="actions" style="justify-content:space-between">
+      <button type="button" class="btn small danger" data-act="sync-off">Turn sync off</button>
+      <span>
+        <button type="button" class="btn" data-act="sdlg-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Connect</button>
+      </span>
     </div>
   </form>
 </dialog>
@@ -219,21 +255,31 @@ const MEDALS = [
    STORAGE — local-first. A cloud sync layer (e.g. Supabase) replaces
    Store.load/save later; the rest of the app does not change.
 ---------------------------------------------------------------- */
-const KEY = 'home.gym.v1';
+const SYNC_URL = '';          // baked-in Worker address; blank = ask on this device
+const KEY  = 'home.gym.v1';
+const UKEY = 'home.gym.url';
+const PKEY = 'home.gym.pin';
+
+const normalize = d => ({
+  profiles:     Array.isArray(d && d.profiles)     ? d.profiles     : [],
+  logs:         Array.isArray(d && d.logs)         ? d.logs         : [],
+  measurements: Array.isArray(d && d.measurements) ? d.measurements : [],
+  deleted:      Array.isArray(d && d.deleted)      ? d.deleted      : [],
+});
 const Store = {
   load(){
     try{
       const d = JSON.parse(localStorage.getItem(KEY));
-      if (d && Array.isArray(d.profiles))
-        return { profiles:d.profiles, logs:d.logs||[], measurements:d.measurements||[] };
+      if (d && Array.isArray(d.profiles)) return normalize(d);
     }catch(e){}
-    return { profiles:[], logs:[], measurements:[] };
+    return normalize(null);
   },
-  save(db){
-    try{ localStorage.setItem(KEY, JSON.stringify(db)); }
+  save(data){
+    try{ localStorage.setItem(KEY, JSON.stringify(data)); }
     catch(e){ toast('Could not save — browser storage is full or blocked'); }
   }
 };
+const tomb = id => db.deleted.push({ id, at: Date.now() });
 
 /* ---------------------------------------------------------------
    HELPERS
@@ -276,7 +322,7 @@ function toast(msg, ms=2600){
 ---------------------------------------------------------------- */
 let db = Store.load();
 const ui = { range:'week', sel:null, tab:'log', ex:'pushup', val:10, confirmDel:false, editing:null };
-const persist = () => Store.save(db);
+const persist = () => { Store.save(db); if(!Sync.applying) Sync.schedule(); };
 
 function stats(pid, since=0){
   const days = new Map();
@@ -447,6 +493,87 @@ function tabProfile(p){
 function renderAll(){ renderBoard(); renderPanel(); }
 
 /* ---------------------------------------------------------------
+   SYNC — posts the whole local state to the Worker, which merges it
+   with every other device's and returns the result. Offline-safe:
+   anything logged while offline is pushed on the next successful run.
+---------------------------------------------------------------- */
+const Sync = {
+  applying:false, busy:false, again:false, timer:null, last:0,
+  url(){ return (SYNC_URL || localStorage.getItem(UKEY) || '').replace(/\/+$/,''); },
+  pin(){ return localStorage.getItem(PKEY) || ''; },
+  on(){ return !!(this.url() && this.pin()); },
+  schedule(){
+    if(!this.on()) { status(); return; }
+    clearTimeout(this.timer);
+    this.timer = setTimeout(()=>this.run(), 1200);
+  },
+  async run(manual){
+    if(!this.on()){ status(); return; }
+    if(this.busy){ this.again=true; return; }
+    if(!navigator.onLine){ status('warn','Offline'); return; }
+    this.busy=true; status('syncing','Syncing…');
+    try{
+      const res = await fetch(this.url()+'/sync', {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json', 'X-Gym-Pin':this.pin() },
+        body: JSON.stringify(db)
+      });
+      if(res.status===401){ status('err','Wrong PIN'); if(manual) openSetup('That PIN was rejected.'); return; }
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      const out = await res.json();
+      if(out && out.data){
+        const next = normalize(out.data);
+        if(JSON.stringify(next) !== JSON.stringify(db)){
+          this.applying=true;
+          db = next; Store.save(db); renderAll();
+          this.applying=false;
+        }
+      }
+      this.last=Date.now(); status('ok');
+      if(manual) toast('Synced');
+    }catch(e){
+      status(navigator.onLine?'err':'warn', navigator.onLine?'Sync failed':'Offline');
+      if(manual) toast('Could not reach the sync address');
+    }finally{
+      this.busy=false;
+      if(this.again){ this.again=false; setTimeout(()=>this.run(),400); }
+    }
+  }
+};
+
+function status(kind, text){
+  const pill=$('#syncPill'), txt=$('#syncTxt'), note=$('#footNote');
+  if(!Sync.on()){ kind='' ; text='Local only'; }
+  else if(!kind){ kind='ok'; text='Synced'; }
+  pill.className='pill'+(kind?' '+kind:'');
+  txt.textContent=text||'Synced';
+  note.innerHTML = Sync.on()
+    ? 'Workouts sync to every family device. Last sync: <b>'+(Sync.last?new Date(Sync.last).toLocaleTimeString('en-SG',{hour:'numeric',minute:'2-digit'}):'not yet')+'</b>. Export is still your backup.'
+    : 'Saved on <b>this device only</b>. Tap <b>Sync settings</b> to share workouts across the family.';
+}
+
+function openSetup(msg){
+  $('#urlRow').style.display = SYNC_URL ? 'none' : '';
+  $('#sUrl').value = localStorage.getItem(UKEY) || '';
+  $('#sPin').value = Sync.pin();
+  $('#sErr').textContent = msg || '';
+  $('#sdlg').showModal();
+}
+function saveSetup(e){
+  e.preventDefault();
+  const u=$('#sUrl').value.trim(), pin=$('#sPin').value.trim();
+  if(!SYNC_URL){
+    if(!u) return $('#sErr').textContent='Paste the sync address.';
+    if(!/^https:\/\/[^\s]+$/i.test(u) && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(u))
+      return $('#sErr').textContent='The address must start with https://';
+    localStorage.setItem(UKEY,u);
+  }
+  if(!pin) return $('#sErr').textContent='Enter the household PIN.';
+  localStorage.setItem(PKEY,pin);
+  $('#sdlg').close(); status(); Sync.run(true);
+}
+
+/* ---------------------------------------------------------------
    ACTIONS
 ---------------------------------------------------------------- */
 function clampVal(v){
@@ -508,9 +635,9 @@ function saveProfile(e){
   if(hv!==null && !(hv>=30&&hv<=250)) return err('Height should be between 30 and 250 cm.');
   if(wv!==null && !(wv>=5&&wv<=300)) return err('Weight should be between 5 and 300 kg.');
   if(ui.editing){
-    const p=profile(ui.editing); Object.assign(p,{name,sex,dob,color});
+    const p=profile(ui.editing); Object.assign(p,{name,sex,dob,color,updatedAt:Date.now()});
   }else{
-    const p={ id:uid(), name, sex, dob, color, createdAt:Date.now() };
+    const p={ id:uid(), name, sex, dob, color, createdAt:Date.now(), updatedAt:Date.now() };
     db.profiles.push(p); ui.sel=p.id; ui.tab='log';
     if(hv!==null||wv!==null) db.measurements.push({ id:uid(), pid:p.id, ts:Date.now(), h:hv, w:wv });
   }
@@ -601,18 +728,26 @@ document.addEventListener('click', e=>{
       break;
     case 'log': logEntry(); break;
     case 'del-log':
+      tomb(t.dataset.id);
       db.logs=db.logs.filter(l=>l.id!==t.dataset.id); persist(); toast('Entry removed'); renderAll(); break;
     case 'del-ms':
+      tomb(t.dataset.id);
       db.measurements=db.measurements.filter(m=>m.id!==t.dataset.id); persist(); renderAll(); break;
     case 'add-ms': addMeasurement(); break;
     case 'del-profile': ui.confirmDel=true; renderPanel(); break;
     case 'del-profile-no': ui.confirmDel=false; renderPanel(); break;
     case 'del-profile-yes':{
       const id=ui.sel;
+      tomb(id);
       db.profiles=db.profiles.filter(p=>p.id!==id);
       db.logs=db.logs.filter(l=>l.pid!==id);
       db.measurements=db.measurements.filter(m=>m.pid!==id);
       ui.sel=null; ui.confirmDel=false; persist(); toast('Profile deleted'); renderAll(); break; }
+    case 'sync-now': Sync.on() ? Sync.run(true) : openSetup(); break;
+    case 'setup': openSetup(); break;
+    case 'sdlg-cancel': $('#sdlg').close(); break;
+    case 'sync-off':
+      localStorage.removeItem(PKEY); $('#sdlg').close(); status(); toast('Sync turned off on this device'); break;
     case 'export': exportData(); break;
     case 'import': $('#importFile').click(); break;
   }
@@ -624,13 +759,19 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Enter' && e.target.id==='val'){ e.preventDefault(); logEntry(); }
 });
 $('#pform').addEventListener('submit', saveProfile);
+$('#sform').addEventListener('submit', saveSetup);
+addEventListener('online',  ()=>Sync.run());
+addEventListener('offline', ()=>status('warn','Offline'));
+setInterval(()=>{ if(!document.hidden) Sync.run(); }, 60000);
 $('#importFile').addEventListener('change', e=>{
   if(e.target.files[0]) importData(e.target.files[0]); e.target.value='';
 });
 // keep the "this week" board honest if the tab stays open across midnight / Monday
-document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) renderAll(); });
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden){ renderAll(); Sync.run(); } });
 
 renderAll();
+status();
+if(Sync.on()) Sync.run();
 })();
 </script>
 </body>
